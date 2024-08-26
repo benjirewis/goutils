@@ -115,7 +115,11 @@ func (p *managedProcess) kill() (bool, error) {
 	select {
 	case <-timer2.C:
 		p.logger.Infof("killing entire process group %d", p.cmd.Process.Pid)
-		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		// NOTE(benji): Use a SIGQUIT here to get the stack trace of the running Golang module. Trying
+		// to debug why `TestResourcelessModuleRemove` sometimes get to this step of `kill`. Golang
+		// module must be "stuck" somewhere and presumably not yet; waiting on the `ctx.Done` channel
+		// in its `main` method.
+		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGQUIT); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return false, errors.Wrapf(err, "error killing process group %d", p.cmd.Process.Pid)
 		}
 		forceKilled = true
