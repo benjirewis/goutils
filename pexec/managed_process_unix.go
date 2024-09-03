@@ -125,9 +125,9 @@ func (p *managedProcess) kill() (bool, error) {
 		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGQUIT); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return false, errors.Wrapf(err, "error killing process group %d", p.cmd.Process.Pid)
 		}
-		// NOTE(benji): Give the module a full 2 seconds to dump its goroutines. If we do not sleep
+		// NOTE(benji): Give the module a full 10 seconds to dump its goroutines. If we do not sleep
 		// here, the testing object will cease executing and we will miss some goroutine output.
-		time.Sleep(2 * time.Second)
+		time.Sleep(10 * time.Second)
 		forceKilled = true
 	case <-p.managingCh:
 		timer2.Stop()
