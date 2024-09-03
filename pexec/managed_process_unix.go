@@ -110,7 +110,10 @@ func (p *managedProcess) kill() (bool, error) {
 
 	// Lastly, kill everything in the process group that remains after a longer wait
 	var forceKilled bool
-	timer2 := time.NewTimer(p.stopWaitInterval * 2)
+	// NOTE(benji): Wait for 2.5 minutes between SIGTERM of the process group and
+	// SIGQUIT to ensure we are dealing with a real hang and not just slowness in
+	// the pion code.
+	timer2 := time.NewTimer(150 * time.Second)
 	defer timer2.Stop()
 	select {
 	case <-timer2.C:
