@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/stun"
@@ -24,6 +26,105 @@ import (
 const testDelayAnswererNegotiationVar = "TEST_DELAY_ANSWERER_NEGOTIATION"
 
 const heartbeatReceivedLog = "Received a heartbeat from the signaling server"
+
+const (
+	twilioSTUNURL       = "stun:global.stun.twilio.com:3478"
+	viamFallbackSTUNURL = "stun:turn.viam.com:443"
+	stunCheckInterval   = 5 * time.Minute
+	stunCheckTimeout    = 5 * time.Second
+)
+
+// twilioSTUNReachable tracks whether the Twilio STUN server is reachable. It defaults to true
+// (reachable) and is updated by runSTUNConnectivityChecker.
+var twilioSTUNReachable atomic.Bool //nolint:gochecknoglobals
+
+func init() {
+	twilioSTUNReachable.Store(true)
+}
+
+// effectiveICEServers returns DefaultICEServers when the Twilio STUN server is reachable,
+// and falls back to the Viam STUN server when it is not.
+func effectiveICEServers() []webrtc.ICEServer {
+	if twilioSTUNReachable.Load() {
+		return DefaultICEServers
+	}
+	return []webrtc.ICEServer{{URLs: []string{viamFallbackSTUNURL}}}
+}
+
+// sendSTUNBindingRequest dials the given STUN URI over UDP, sends a binding request, and waits for
+// a binding success response. It returns an error if the server is unreachable or the response is
+// unexpected.
+func sendSTUNBindingRequest(ctx context.Context, stunURL string) error {
+	u, err := stun.ParseURI(stunURL)
+	if err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(u.Host, strconv.Itoa(u.Port))
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(stunCheckTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+
+	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+	if _, err := req.WriteTo(conn); err != nil {
+		return err
+	}
+
+	resp := new(stun.Message)
+	resp.Raw = make([]byte, 1500)
+	if _, err := resp.ReadFrom(conn); err != nil {
+		return err
+	}
+	if resp.Type != stun.BindingSuccess {
+		return fmt.Errorf("unexpected STUN response type: %v", resp.Type)
+	}
+	return nil
+}
+
+// runSTUNConnectivityChecker sends a STUN binding request to the Twilio STUN server immediately
+// and then every stunCheckInterval. If the request fails, twilioSTUNReachable is set to false so
+// that subsequent WebRTC connections use the Viam fallback STUN server.
+func runSTUNConnectivityChecker(ctx context.Context, logger utils.ZapCompatibleLogger) {
+	check := func() {
+		checkCtx, cancel := context.WithTimeout(ctx, stunCheckTimeout)
+		defer cancel()
+		if err := sendSTUNBindingRequest(checkCtx, twilioSTUNURL); err != nil {
+			if !twilioSTUNReachable.Load() {
+				logger.Debugw("Twilio STUN server still unreachable, continuing with Viam fallback", "error", err)
+			} else {
+				logger.Warnw("Twilio STUN server unreachable, switching to Viam fallback STUN server",
+					"error", err, "fallback", viamFallbackSTUNURL)
+				twilioSTUNReachable.Store(false)
+			}
+		} else if !twilioSTUNReachable.Load() {
+			logger.Infow("Twilio STUN server reachable again, switching back to Twilio STUN server")
+			twilioSTUNReachable.Store(true)
+		}
+	}
+
+	check()
+	ticker := time.NewTicker(stunCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
 
 // A webrtcSignalingAnswerer listens for and answers calls with a given signaling service. It is
 // directly connected to a Server that will handle the actual calls/connections over WebRTC
@@ -331,13 +432,15 @@ func (aa *answerAttempt) connect(ctx context.Context) (err error) {
 		}
 	}()
 
+	webrtcConfig := aa.webrtcConfig
+	webrtcConfig.ICEServers = effectiveICEServers()
+
 	// If SOCKS proxy is indicated by environment, extend WebRTC config with an
 	// `OptionalWebRTCConfig` call to the signaling server. The usage of a SOCKS
 	// proxy indicates that the server may need a local TURN ICE candidate to
 	// make a conntion to any peer. Nomination of that type of candidate is only
 	// possible through extending the WebRTC config with a TURN URL (and
 	// associated username and password).
-	webrtcConfig := aa.webrtcConfig
 	behindProxy := os.Getenv(SocksProxyEnvVar) != ""
 	var turnURI *stun.URI
 	turnURIStr := os.Getenv(TURNURIEnvVar)

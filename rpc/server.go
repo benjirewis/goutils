@@ -148,6 +148,9 @@ type simpleServer struct {
 	// authIssuer is the JWT issuer (iss) that will be used for our service.
 	authIssuer string
 
+	// stunCheckerCancel stops the background STUN connectivity checker started in Start().
+	stunCheckerCancel context.CancelFunc
+
 	// counters are for reporting FTDC metrics. A `simpleServer` sets up both a grpc server wrapping
 	// a standard http2 over TCP connection. And it also sets up grpc services for webrtc
 	// PeerConnections. These counters are specifically for requests coming in over TCP.
@@ -843,6 +846,15 @@ func (ss *simpleServer) Start() error {
 	}
 	ss.mu.Unlock()
 
+	stunCtx, stunCancel := context.WithCancel(context.Background())
+	ss.mu.Lock()
+	ss.stunCheckerCancel = stunCancel
+	ss.mu.Unlock()
+	ss.activeBackgroundWorkers.Add(1)
+	utils.ManagedGo(func() {
+		runSTUNConnectivityChecker(stunCtx, ss.logger)
+	}, ss.activeBackgroundWorkers.Done)
+
 	var err error
 	var errMu sync.Mutex
 	utils.PanicCapturingGo(func() {
@@ -925,6 +937,9 @@ func (ss *simpleServer) Stop() error {
 		return nil
 	}
 	ss.stopped = true
+	if ss.stunCheckerCancel != nil {
+		ss.stunCheckerCancel()
+	}
 	var err error
 	ss.logger.Info("stopping")
 	for idx, answerer := range ss.webrtcAnswerers {
